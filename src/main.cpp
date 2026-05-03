@@ -10,10 +10,18 @@
 #include <Adafruit_NeoPixel.h>
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
-// INPUT_PULLUP: HIGH = door open (reed opens), LOW = door closed (reed shorts to GND)
-constexpr uint8_t PIN_REED = 3;   // reed contact — adjust if wired differently
-constexpr uint8_t PIN_FSR  = 4;   // FSR pressure sensor (ADC)
+constexpr uint8_t PIN_HALL = 3;   // 49E linear Hall sensor — analog output
 constexpr uint8_t PIN_LED  = 8;   // WS2812 built-in LED (C3 SuperMini)
+
+// Hall detection thresholds (V): idle ~1.65V, magnet pushes voltage above/below
+constexpr float HALL_IDLE     = 1.65f;
+constexpr float HALL_HI_TRESH = 2.10f;  // above this = magnet (closed)
+constexpr float HALL_LO_TRESH = 1.20f;  // below this = magnet (closed)
+// field strength = how far voltage has moved from idle, 0–100 %
+inline float hallFieldPct(float v) {
+    float d = fabsf(v - HALL_IDLE) / (HALL_HI_TRESH - HALL_IDLE) * 100.0f;
+    return d > 100.0f ? 100.0f : d;
+}
 
 // ── Fixed device identity ─────────────────────────────────────────────────────
 const char DEVICE_ID[] = "esp32-c3-supermini-door";
@@ -30,8 +38,6 @@ constexpr uint32_t WIFI_CONNECT_TIMEOUT = 15000;
 constexpr uint32_t WIFI_RETRY_DELAY     = 10000;
 constexpr uint32_t MQTT_RETRY_DELAY     = 5000;
 constexpr uint32_t PUBLISH_INTERVAL     = 30000;
-constexpr uint32_t FSR_READ_INTERVAL    = 100;
-constexpr uint8_t  FSR_AVG_WINDOW       = 10;
 constexpr uint32_t DOOR_DEBOUNCE_MS     = 50;
 
 // ── Persistent configuration (stored in NVS via Preferences) ─────────────────
@@ -42,6 +48,7 @@ struct Config {
     uint16_t mqttPort = 1883;
     String mqttUser = "pi";
     String mqttPass = "FeelTheAlps2025!";
+    uint32_t doorOpenCooldownMs = 3000;  // ms — min time door stays OPEN before CLOSED is accepted
 } cfg;
 
 void loadConfig() {
@@ -55,6 +62,9 @@ void loadConfig() {
     cfg.mqttPort = p.getUShort("port", cfg.mqttPort);
     cfg.mqttUser = p.getString("user", cfg.mqttUser.c_str());
     cfg.mqttPass = p.getString("pass", cfg.mqttPass.c_str());
+    p.end();
+    p.begin("reed", true);
+    cfg.doorOpenCooldownMs = p.getUInt("cooldown", cfg.doorOpenCooldownMs);
     p.end();
 }
 
@@ -83,6 +93,53 @@ void saveMqtt(const String& host, uint16_t port,
     cfg.mqttPass = pass;
 }
 
+void saveCooldown(uint32_t cooldownMs) {
+    Preferences p;
+    p.begin("reed", false);
+    p.putUInt("cooldown", cooldownMs);
+    p.end();
+    cfg.doorOpenCooldownMs = cooldownMs;
+}
+
+// ── NetLog — mirrors Serial to a single TCP client on port 23 (telnet) ────────
+class NetLog : public Print {
+    WiFiServer _srv;
+    WiFiClient _client;
+public:
+    NetLog() : _srv(23) {}
+
+    void begin() { _srv.begin(); }
+
+    void tick() {
+        if (!_client || !_client.connected()) {
+            WiFiClient c = _srv.available();
+            if (c) { _client = c; _client.println("\r\n=== Door Sensor log stream ==="); }
+        }
+    }
+
+    int printf(const char* fmt, ...) {
+        char buf[256];
+        va_list args;
+        va_start(args, fmt);
+        int n = vsnprintf(buf, sizeof(buf), fmt, args);
+        va_end(args);
+        if (n > 0) write(reinterpret_cast<const uint8_t*>(buf), (size_t)n);
+        return n;
+    }
+
+    size_t write(uint8_t c) override {
+        Serial.write(c);
+        if (_client && _client.connected()) _client.write(c);
+        return 1;
+    }
+
+    size_t write(const uint8_t* buf, size_t sz) override {
+        Serial.write(buf, sz);
+        if (_client && _client.connected()) _client.write(buf, sz);
+        return sz;
+    }
+} Log;
+
 // ── Objects ───────────────────────────────────────────────────────────────────
 Adafruit_NeoPixel led(1, PIN_LED, NEO_GRB + NEO_KHZ800);
 WiFiClient   wifiClient;
@@ -92,7 +149,6 @@ DNSServer    dns;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 enum class NetMode { IDLE, CONNECTING, CONNECTED, AP };
-enum FsrLevel { FSR_LOW, FSR_MEDIUM, FSR_HIGH };
 
 struct {
     NetMode  net           = NetMode::IDLE;
@@ -105,12 +161,8 @@ struct {
     bool     rawDoor       = false;
     uint32_t debounceAt    = 0;
     bool     debouncing    = false;
-
-    float    fsrV          = 0.0f;
-    uint32_t lastFsrRead   = 0;
-    uint32_t fsrSamples[FSR_AVG_WINDOW] = {};
-    uint8_t  fsrIdx        = 0;
-    FsrLevel fsrLevel      = FSR_LOW;
+    uint32_t doorOpenedAt  = 0;   // millis() when door last went OPEN
+    float    hallV         = HALL_IDLE;  // last Hall sensor voltage (updated every tickDoor)
 
     uint32_t ledOffAt      = 0;
     uint32_t lastPublish   = 0;
@@ -132,9 +184,11 @@ static String tBinary(const char* n) { return String(DEVICE_ID) + "/binary_senso
 void publishAll() {
     if (!mqtt.connected()) return;
     char buf[32];
-    mqtt.publish(tBinary("door_contact__reed_").c_str(), S.doorOpen ? "ON" : "OFF", true);
-    snprintf(buf, sizeof(buf), "%.3f", S.fsrV);
-    mqtt.publish(tSensor("fsr_pressure_sensor").c_str(), buf);
+    mqtt.publish(tBinary("door").c_str(), S.doorOpen ? "ON" : "OFF", true);
+    snprintf(buf, sizeof(buf), "%.3f", S.hallV);
+    mqtt.publish(tSensor("hall_voltage").c_str(), buf);
+    snprintf(buf, sizeof(buf), "%.1f", hallFieldPct(S.hallV));
+    mqtt.publish(tSensor("hall_field_strength").c_str(), buf);
     snprintf(buf, sizeof(buf), "%d", WiFi.RSSI());
     mqtt.publish(tSensor("wifi_signal_strength").c_str(), buf);
     int q = WiFi.RSSI() <= -100 ? 0 : WiFi.RSSI() >= -50 ? 100 : 2*(WiFi.RSSI()+100);
@@ -212,7 +266,18 @@ void mqttConnect() {
         ledSet(0, 40, 40, 800);  // cyan flash = MQTT up
         publishAll();
     } else {
-        Serial.printf("[MQTT] Failed rc=%d\n", mqtt.state());
+        int rc = mqtt.state();
+        const char* reason =
+            rc == -4 ? "timeout" :
+            rc == -3 ? "connection lost" :
+            rc == -2 ? "connect failed (broker unreachable)" :
+            rc == -1 ? "disconnected" :
+            rc ==  1 ? "bad protocol" :
+            rc ==  2 ? "bad client ID" :
+            rc ==  3 ? "broker unavailable" :
+            rc ==  4 ? "bad credentials" :
+            rc ==  5 ? "unauthorized (wrong user/pass)" : "unknown";
+        Serial.printf("[MQTT] Failed rc=%d (%s)\n", rc, reason);
     }
     S.lastMqttTry = millis();
 }
@@ -236,47 +301,30 @@ void shellySet(bool on) {
     Serial.printf("[Shelly] %s → HTTP %d\n", on ? "ON" : "OFF", rc);
 }
 
-// ── Door reed ─────────────────────────────────────────────────────────────────
+// ── Door Hall sensor ──────────────────────────────────────────────────────────
 void tickDoor() {
-    bool raw = (digitalRead(PIN_REED) == HIGH);
+    // 49E linear Hall: idle ~1.65V, field pushes voltage above HALL_HI_TRESH or below HALL_LO_TRESH.
+    // raw=true = door OPEN (no magnet); raw=false = door CLOSED (magnet detected).
+    float pinV = analogRead(PIN_HALL) / 4095.0f * 3.3f;
+    S.hallV = pinV;
+    bool raw = (pinV >= HALL_LO_TRESH && pinV <= HALL_HI_TRESH);
     uint32_t now = millis();
     if (raw != S.rawDoor) { S.rawDoor = raw; S.debounceAt = now; S.debouncing = true; }
     if (S.debouncing && now - S.debounceAt >= DOOR_DEBOUNCE_MS) {
         S.debouncing = false;
         if (S.rawDoor != S.doorOpen) {
+            // Closing: only accept if the door has been open long enough
+            if (!S.rawDoor && (now - S.doorOpenedAt < cfg.doorOpenCooldownMs)) return;
             S.doorOpen = S.rawDoor;
+            if (S.doorOpen) S.doorOpenedAt = now;
             Serial.printf("[Door] %s\n", S.doorOpen ? "OPEN" : "CLOSED");
             if (mqtt.connected())
-                mqtt.publish(tBinary("door_contact__reed_").c_str(),
+                mqtt.publish(tBinary("door").c_str(),
                              S.doorOpen ? "ON" : "OFF", true);
+            shellySet(S.doorOpen);  // OPEN → Shelly ON, CLOSED → Shelly OFF
             ledSet(S.doorOpen ? 80 : 0, S.doorOpen ? 0 : 80, 0, 500);
         }
     }
-}
-
-// ── FSR ───────────────────────────────────────────────────────────────────────
-void tickFsr() {
-    if (millis() - S.lastFsrRead < FSR_READ_INTERVAL) return;
-    S.lastFsrRead = millis();
-    S.fsrSamples[S.fsrIdx++ % FSR_AVG_WINDOW] = analogRead(PIN_FSR);
-    uint32_t sum = 0;
-    for (uint8_t i = 0; i < FSR_AVG_WINDOW; i++) sum += S.fsrSamples[i];
-    S.fsrV = (sum / (float)FSR_AVG_WINDOW / 4095.0f) * 3.3f;
-
-    FsrLevel lvl = S.fsrV > 1.0f ? FSR_HIGH : S.fsrV > 0.5f ? FSR_MEDIUM : FSR_LOW;
-    if (lvl == S.fsrLevel) return;
-    if (lvl == FSR_HIGH) {
-        Serial.printf("[FSR] ALARM %.3fV\n", S.fsrV);
-        if (mqtt.connected()) mqtt.publish("door/alarm", "Lamp on");
-        shellySet(true);
-        ledSet(80, 0, 0, 20000);
-    } else if (lvl == FSR_MEDIUM && S.fsrLevel == FSR_LOW) {
-        Serial.printf("[FSR] MEDIUM %.3fV\n", S.fsrV);
-        if (mqtt.connected()) mqtt.publish("door/alarm", "Lamp off");
-        shellySet(false);
-        ledSet(0, 80, 0, 3000);
-    }
-    S.fsrLevel = lvl;
 }
 
 // ── Shared CSS ────────────────────────────────────────────────────────────────
@@ -342,35 +390,65 @@ void handleRoot() {
         return;
     }
     String h = pageHead("Status", "/");
-    h += "<div class='card'><h2>🚪 Türsensor</h2>"
-         "<div class='row'><span class='lbl'>Reed contact</span>";
-    h += S.doorOpen ? "<span class='val open'>🔓 OPEN</span>"
-                    : "<span class='val closed'>🔒 CLOSED</span>";
-    h += "</div><div class='row'><span class='lbl'>FSR voltage</span>"
-         "<span class='val'>" + String(S.fsrV, 3) + " V</span></div></div>";
+    float hv = analogRead(PIN_HALL) / 4095.0f * 3.3f;
+    int   fp = (int)hallFieldPct(hv);
+    h += "<div class='card'><h2>🚪 Door Sensor</h2>"
+         "<div class='row'><span class='lbl'>Door</span>"
+         "<span id='d-door' class='val ";
+    h += S.doorOpen ? "open'>\xF0\x9F\x94\x93 OPEN" : "closed'>\xF0\x9F\x94\x92 CLOSED";
+    h += "</span></div>"
+         "<div class='row'><span class='lbl'>Hall voltage</span>"
+         "<span class='val'><span id='d-reedv'>" + String(hv, 3) + "</span> V"
+         " <span style='color:var(--mu);font-weight:400'>(idle ~1.65 V)</span></span></div>"
+         "<div class='row'><span class='lbl'>Field strength</span>"
+         "<span class='val' style='width:60%'>"
+         "<span id='d-field'>" + String(fp) + "</span>%"
+         "<progress id='d-prog' value='" + String(fp) + "' max='100' style='display:block;margin-top:3px'></progress>"
+         "</span></div></div>";
 
     h += "<div class='card'><h2>📶 Network</h2>"
          "<div class='row'><span class='lbl'>IP address</span><span class='val'>"
          + WiFi.localIP().toString() + "</span></div>"
          "<div class='row'><span class='lbl'>SSID</span><span class='val'>"
          + WiFi.SSID() + "</span></div>"
-         "<div class='row'><span class='lbl'>RSSI</span><span class='val'>"
-         + String(WiFi.RSSI()) + " dBm</span></div>"
+         "<div class='row'><span class='lbl'>RSSI</span>"
+         "<span class='val'><span id='d-rssi'>" + String(WiFi.RSSI()) + "</span> dBm</span></div>"
          "<div class='row'><span class='lbl'>MQTT broker</span><span class='val'>"
          + cfg.mqttHost + ":" + String(cfg.mqttPort) + "</span></div>"
-         "<div class='row'><span class='lbl'>MQTT</span><span class='val "
+         "<div class='row'><span class='lbl'>MQTT</span>"
+         "<span id='d-mqtt' class='val "
          + String(mqtt.connected() ? "ok'>Connected" : "err'>Disconnected")
          + "</span></div></div>";
 
     h += "<div class='card'><h2>⚙️ System</h2>"
-         "<div class='row'><span class='lbl'>Uptime</span><span class='val'>"
-         + String(millis() / 60000UL) + " min</span></div>"
-         "<div class='row'><span class='lbl'>Free heap</span><span class='val'>"
-         + String(ESP.getFreeHeap() / 1024) + " kB</span></div>"
+         "<div class='row'><span class='lbl'>Uptime</span>"
+         "<span class='val'><span id='d-uptime'>" + String(millis() / 60000UL) + "</span> min</span></div>"
+         "<div class='row'><span class='lbl'>Free heap</span>"
+         "<span class='val'><span id='d-heap'>" + String(ESP.getFreeHeap() / 1024) + "</span> kB</span></div>"
          "<div class='row'><span class='lbl'>Device ID</span><span class='val'>"
          + String(DEVICE_ID) + "</span></div>"
          "<form action='/restart' method='POST'>"
          "<button class='btn' type='submit'>🔄 Restart</button></form></div>";
+
+    h += R"(<script>
+function upd(id,v){var e=document.getElementById(id);if(e)e.innerHTML=v;}
+function poll(){
+  fetch('/data').then(function(r){return r.json();}).then(function(d){
+    var open=d.door_open;
+    var el=document.getElementById('d-door');
+    if(el){el.className='val '+(open?'open':'closed');el.textContent=(open?'\uD83D\uDD13 OPEN':'\uD83D\uDD12 CLOSED');}
+    upd('d-reedv',d.hall_voltage);
+    upd('d-field',d.hall_field_pct);
+    var pr=document.getElementById('d-prog');if(pr)pr.value=d.hall_field_pct;
+    upd('d-rssi',d.wifi_rssi);
+    var me=document.getElementById('d-mqtt');
+    if(me){me.className='val '+(d.mqtt?'ok':'err');me.textContent=d.mqtt?'Connected':'Disconnected';}
+    upd('d-uptime',Math.floor(d.uptime_s/60));
+    upd('d-heap',Math.floor(d.free_heap/1024));
+  }).catch(function(){});
+}
+setInterval(poll,2000);
+</script>)";
 
     h += "</body></html>";
     server.send(200, "text/html", h);
@@ -381,9 +459,10 @@ void handleData() {
     int32_t rssi = WiFi.RSSI();
     int q = rssi <= -100 ? 0 : rssi >= -50 ? 100 : 2*(rssi+100);
     String j = "{";
-    j += "\"door_open\":"    + String(S.doorOpen ? "true" : "false") + ",";
-    j += "\"fsr_voltage\":"  + String(S.fsrV, 3) + ",";
-    j += "\"wifi_rssi\":"    + String(rssi) + ",";
+    j += "\"door_open\":"       + String(S.doorOpen ? "true" : "false") + ",";
+    j += "\"hall_voltage\":"    + String(S.hallV, 3) + ",";
+    j += "\"hall_field_pct\":"  + String((int)hallFieldPct(S.hallV)) + ",";
+    j += "\"wifi_rssi\":"       + String(rssi) + ",";
     j += "\"wifi_quality\":" + String(q) + ",";
     j += "\"ip\":\""         + WiFi.localIP().toString() + "\",";
     j += "\"mqtt\":"         + String(mqtt.connected() ? "true" : "false") + ",";
@@ -423,6 +502,11 @@ void handleConfigGet() {
          "<label>Password</label>"
          "<input name='m_pass' type='password' placeholder='Leave blank to keep current'>"
          "</div>"
+         "<div class='card'><h2>🚪 Door Sensor</h2>"
+         "<p style='font-size:.78rem;color:var(--mu);margin-bottom:.6rem'>Hall sensor (49E). Detection thresholds are fixed in firmware: &lt;" + String(HALL_LO_TRESH, 2) + " V or &gt;" + String(HALL_HI_TRESH, 2) + " V = CLOSED.</p>"
+         "<label>Open cooldown (ms) <span style='color:var(--mu);font-size:.75rem'>— min time door stays OPEN before CLOSED is accepted (100 – 30000, default 3000)</span></label>"
+         "<input name='r_cooldown' type='number' step='100' min='100' max='30000' value='" + String(cfg.doorOpenCooldownMs) + "'>"
+         "</div>"
          "<button class='btn btn-p' type='submit'>💾 Save &amp; Restart</button>"
          "</form></body></html>";
 
@@ -446,6 +530,11 @@ void handleConfigPost() {
         if (mUser.isEmpty()) mUser = cfg.mqttUser;
         uint16_t port = mPort.toInt() > 0 ? (uint16_t)mPort.toInt() : (uint16_t)1883;
         saveMqtt(mHost, port, mUser, mPass);
+    }
+    String rCooldown = server.arg("r_cooldown");
+    if (!rCooldown.isEmpty()) {
+        uint32_t c = (uint32_t)rCooldown.toInt();
+        if (c >= 100 && c <= 30000) saveCooldown(c);
     }
     server.sendHeader("Location", "/config?saved=1");
     server.send(302);
@@ -544,12 +633,13 @@ void setup() {
                   cfg.wifiSsid.c_str(), cfg.mqttHost.c_str(),
                   cfg.mqttPort, cfg.mqttUser.c_str());
 
-    pinMode(PIN_REED, INPUT_PULLUP);
-    S.rawDoor = S.doorOpen = (digitalRead(PIN_REED) == HIGH);
-    Serial.printf("[Door] Initial: %s\n", S.doorOpen ? "OPEN" : "CLOSED");
-
-    analogReadResolution(12);
-    analogSetPinAttenuation(PIN_FSR, ADC_11db);
+    pinMode(PIN_HALL, INPUT);
+    analogSetPinAttenuation(PIN_HALL, ADC_11db);
+    float initV = analogRead(PIN_HALL) / 4095.0f * 3.3f;
+    S.hallV    = initV;
+    S.rawDoor  = S.doorOpen = (initV >= HALL_LO_TRESH && initV <= HALL_HI_TRESH);
+    Serial.printf("[Door] Initial: %s  (%.3fV, field %.0f%%)\n",
+                  S.doorOpen ? "OPEN" : "CLOSED", initV, hallFieldPct(initV));
 
     WiFi.setAutoReconnect(false);  // we manage reconnection manually
     WiFi.mode(WIFI_STA);
@@ -601,16 +691,15 @@ void loop() {
     tickWifi();
     tickMqtt();
     tickDoor();
-    tickFsr();
     server.handleClient();
     if (S.otaReady) ArduinoOTA.handle();
 
     if (millis() - S.lastPublish >= PUBLISH_INTERVAL) {
         S.lastPublish = millis();
         publishAll();
-        Serial.printf("[Pub] door=%s fsr=%.3fV rssi=%ddBm mqtt=%s\n",
-                      S.doorOpen ? "OPEN" : "CLOSED", S.fsrV,
-                      WiFi.RSSI(), mqtt.connected() ? "ok" : "off");
+        Serial.printf("[Pub] door=%s hall=%.3fV field=%.0f%% rssi=%ddBm mqtt=%s\n",
+                      S.doorOpen ? "OPEN" : "CLOSED", S.hallV,
+                      hallFieldPct(S.hallV), WiFi.RSSI(), mqtt.connected() ? "ok" : "off");
     }
     delay(1);
 }
